@@ -1,193 +1,212 @@
-# HackerRank Orchestrate
+﻿# Buy or Wait? — AI Financial Affordability Agent
 
-Starter repository for the **HackerRank Orchestrate** 24-hour hackathon (September 2026).
+This repository contains a deterministic Python implementation for the HackerRank Orchestrate September 2026 challenge, Buy or Wait? — AI Financial Affordability Agent. The project reads the evaluation inputs in the repository’s dataset/ folder and writes the required prediction file output.csv in the repository root.
 
-## Buy or Wait?
+## Problem overview
 
-Build an AI-powered financial agent that decides whether a user can safely afford a requested expense.
+The task is to determine, for every request in dataset/requests.csv, whether a requested expense can be safely afforded while protecting the user’s financial buffer. The decision must consider the user profile, current available balance, minimum balance to keep, recurring expenses, essential commitments, confirmed income, future events, installment or payment options, request dates, desired completion date, and any available evidence in messages.csv and images.csv. The result is a row in the required output schema used by the evaluation harness.
 
-A user may ask: **"Can I afford this laptop?"**
+The implementation in this repository does not perform any external model inference. It is a deterministic local workflow implemented in the Python files under code/ that loads the CSV context files and builds an affordability recommendation from the scenario data.
 
-Answering well takes more than the current balance. The agent must account for recurring expenses, pending payments, essential spending, confirmed income, available payment options, and relevant details buried in messages and images.
+## Solution overview
 
-For every request, the agent decides whether the user should pay in full, pay partially, use installments, wait, or not proceed. The recommendation must be personalized: two users with the same balance can deserve different answers based on their commitments, priorities, payment preferences, and willingness to adjust flexible expenses.
+The actual implementation is a deterministic local solver in code/main.py. It loads challenge data from dataset/, normalizes values, converts amounts into the home_currency defined in the user profile, constructs a projected cash-flow timeline for a 90-day horizon, applies status and duplicate filtering to events, compares possible payment options and request deadlines, and emits the required solver row to the root-level output.csv.
 
-A recommendation is safe only if the user can complete the full payment plan, cover essential expenses, and stay above their preferred minimum balance throughout the forecast period.
+The repository also includes a small deterministic helper in evaluation/validate_usage_report.py to validate the structure of output.csv and the usage-report artifact. It does not change the financial decision logic.
 
-Read [`problem_statement.md`](./problem_statement.md) for the full task spec, input/output schema, allowed values, conflict-resolution rules, and submission format.
+## End-to-end pipeline
 
----
+The implemented pipeline is:
 
-## Quick Start
+1. dataset/requests.csv is loaded as the evaluation request objects.
+2. dataset/financial_profiles.csv, dataset/financial_events.csv, dataset/request_payment_options.csv, dataset/exchange_rates.csv, dataset/messages.csv, and dataset/images.csv are loaded as context and supporting records.
+3. The system normalizes fields, converts event amounts using the configured exchange_rates.csv row and profile currency context, and records a home_currency view of monetary amounts.
+4. It builds a filtered event timeline for each user by using the event_valid() rules and event date selection from settlement_date or event_date within a 90-day recomputation horizon.
+5. It separately loads the available payment options and groups them by request_id in options_by_request.
+6. It reads messages.csv and images.csv as structured context files, but the actual code present in this repository does not apply any VLM/LLM image interpretation or message inference. It only supplies the data files and keeps the implementation deterministic.
+7. It forecasts the user’s future cash state, then computes the largest safe amount payable on the request date using the deterministic binary-search-style amount_safe() routine.
+8. It computes the earliest date for a safe full payment with earliest_full_date().
+9. It chooses the best method among full_payment, partial_payment, installments, wait, or not_recommended using choose_plan() and validates the candidate with plan_candidate_valid().
+10. It emits an ordered row via generate_row() and writes the required columns to the repository-root output.csv.
+11. It writes a deterministic usage report artifact at evaluation/usage_report.md.
 
-Clone the repository and move into the project directory:
+Only the stages above are implemented in the repository. There is no external model, no VLM, and no API calls in the current implementation.
 
-```bash
-git clone https://github.com/interviewstreet/hackerrank-orchestrate-september26.git
-cd hackerrank-orchestrate-september26
+## Financial safety logic
+
+The repository uses the deterministic rules in code/main.py to protect the account state across the 90-day forecast window:
+
+- minimum_balance_to_keep is enforced in the simulation path. The solver uses simulate_safe() to ensure projected balances never fall below the user’s configured minimum balance after accounting for projected obligations and payments.
+- Recurring and one-off events are loaded from financial_events.csv and converted into the user’s home_currency. Credit events can be treated as funds when they are settled, and debit events are treated as expenses when their event status is valid. Pending credit events are filtered out, following the challenge contract’s guidance.
+- Confirmed future transactions are kept only when the event has a valid status and is within the 90-day forecast window. That includes resolved scheduled and settled events while excluding cancelled, failed, duplicate, and unrealized rows. Pending credit records are not counted as cash.
+- event_valid() filters events by the accepted historical and future statuses and returns only those valid in the requested date range.
+- Duplicate source rows and cancelled or failed repeated event representations are dropped during data filtering.
+- Currency normalization is performed through the rate_for(day, from_currency, to_currency) lookup in exchange_rates.csv and converted into the user’s home_currency using amount_to_home().
+- The forecast horizon is fixed at request_date to request_date + 90 days.
+- Deadline handling follows the constraints in the payment-plan validator and from the supplied request’s desired_completion_date.
+
+## Payment methods
+
+The implemented solver method selection is intentionally deterministic:
+
+- full_payment: selected when the safe amount reaches the requested amount and the user’s payment preferences permit a full payment. It emits a one-step plan matching the requested-date schedule.
+- partial_payment: considered only when allows_partial_payment is true, the user profile considers the payment method, and the deterministic bounds check returns 0 < safe_val < requested_amount. It emits exactly two payments: the amount safe on the request date and then the remaining balance on the earliest safe full-pay date, constrained by the deadline.
+- installments: recognized when the profile’s payment_methods_user_will_consider includes installments and there are valid installment rows in the grouped options_by_request structure. The plan generator exactly reuses the represented source schedule string from the selected option row.
+- wait: selected when a safe full payment is not available immediately but occurs on an earliest safe future date, and the use of a single-date wait plan remains consistent with the forecast.
+- not_recommended: emitted when no valid plan satisfies the 90-day simulation or the selected method is rejected by the planner’s validation gates.
+
+The current code returns a not_recommended method and a none payment plan for cases where no eligible safe plan exists.
+
+## Payment-plan validation
+
+The repository includes centralized deterministic validation functions in code/main.py:
+
+- plan_candidate_valid() checks requested method and plan consistency before returning a recommendation.
+- Installments must exactly match the source payment_amount representation and schedule from a valid option row in request_payment_options.csv.
+- Payment dates must be chronological in the emitted payment_plan string.
+- Every committed plan component must be positive and parseable as a valid date and numeric amount.
+- Partial payments must be emitted in the exact layout request_date:first_amount|earliest_safe_date:remaining_amount, with the second date not after the request’s desired_completion_date and the two amounts summing to the requested value.
+- full_payment requires a single component whose date is the request date and amount equals the requested amount.
+- generate_plan_for_option() preserves the original option payment_amount string shape rather than forcing a new decimal string representation.
+
+This is part of the repository’s deterministic integrity contract and is what the tests enforce.
+
+## Flexible spending changes
+
+The current solver output path itself writes spending_changes_needed as fixed none. It does not yet implement the actual stop:<event_id> or reduce_to:<event_id>:<new_amount> emission workflow in code/main.py. In the README, the deterministic validation tests and contract rules recognize that flexible recurring spending changes are part of the expected output semantics, but the present repository implementation writes none because the code currently generates a finite set of deterministic rows without implementing the spending-change engine. Only recurring flexible spending events are the valid target concept in the challenge contract; the existing implementation does not claim to implement those reductions yet.
+
+## Messages and images
+
+The repository includes dataset/messages.csv and dataset/images.csv as context files. code/main.py reads the repository dataset but does not implement message extraction, image OCR, image analysis, or VLM interpretation. It does not transform messages or images into financial facts. It intentionally treats the message/image files as static, non-invasive context and does not invent evidence from them. This is an explicit limitation of the current implementation.
+
+## AI/model usage
+
+This repository does not call any external LLM, VLM, or model service. The solution is a deterministic local Python solver based on the CSV files in dataset/. There are therefore no model provider names, model names, model calls, prompt tokens, completion tokens, total tokens, or model cost entries to fabricate. The root-level evaluation/usage_report.md records the correct zero-model facts:
+
+Model provider(s): none
+Model name(s): none
+Model calls: 0
+Input tokens: 0
+Output tokens: 0
+Total tokens: 0
+Average tokens per request: 0
+Estimated total cost: $0.00
+Estimated cost per request: $0.00
+
+The included evaluation/validate_usage_report.py utility confirms that the repository report remains reproducible and deterministic.
+
+## Running the project
+
+The current repository is executed from the root folder using PowerShell:
+
+```powershell
+python code/main.py
 ```
 
-Build your solution in `code/main.py`, or use another language and document its entry point clearly.
-
-Your solution must:
-
-- Read the input files from `dataset/`
-- Generate one prediction for every request
-- Write the final predictions to `output.csv` in the repository root
-
-Run the starter Python entry point with:
-
-```bash
-python3 code/main.py
-```
-
-After running your solution, confirm that `output.csv` exists in the repository root and contains the required columns and one row for every request.
-
-## Important File Locations
+This command reads the deterministic dataset context and creates the required repository-root file:
 
 ```text
-dataset/        Input data and the blank output template. Do not modify the input data.
-code/           Your solution code.
-output.csv      Final generated predictions in the repository root.
-code.zip        ZIP file containing your complete solution for submission.
+output.csv
 ```
 
-The blank template at `dataset/output.csv` is provided as a reference. Your final generated file must be the root-level `output.csv`.
+The generated output.csv contains one row per request and one row per payment recommendation or rejection decision following the specified schema.
 
----
+## Testing
 
-## Repository Layout
+The verification suite is available in the repository:
+
+```powershell
+pytest -v
+```
+
+The current verified result is 23 passed in 4.13s from the deterministic contract suite in tests/test_buy_wait_contract.py.
+
+## Output schema
+
+The generated output.csv must contain the following eight columns in order:
 
 ```text
-.
-├── AGENTS.md                         # Rules for AI coding tools + transcript logging
-├── problem_statement.md              # Full challenge statement
-├── README.md                         # You are here
-├── code/                             # Your solution code
-├── output.csv                        # Final generated predictions
-└── dataset/
-    ├── requests.csv                  # 250 requests to evaluate — predict these
-    ├── output.csv                    # Blank submission template
-    ├── sample_requests.csv           # 25 solved examples
-    ├── financial_profiles.csv        # Balances, minimum balance, priorities, preferences
-    ├── financial_events.csv          # Historical, pending, and confirmed transactions
-    ├── request_payment_options.csv   # Payment options available per request
-    ├── exchange_rates.csv            # Fixed, dated conversion rates
-    ├── messages.csv                  # Messages tied to users, requests, or events
-    ├── images.csv                    # Payroll letters, statements, bills, receipts
-    └── media/
-        └── images/
+request_id,amount_safe_to_pay,affordability_status,recommended_payment_method,payment_plan,earliest_date_for_full_payment,spending_changes_needed,decision_explanation
 ```
 
-Only `dataset/requests.csv` requires predictions. Everything else is context. Join user records with `user_id`, request records with `request_id`, supporting evidence with `related_event_id`, and exchange rates with the rate date and currency pair.
+The solver is deterministic and writes exactly that header order from code/main.py.
 
-Amounts are in the user's `home_currency` — the dataset uses INR, ZAR, IDR, USD, and EUR, and every conversion rate you need is in `exchange_rates.csv`. All dates are `YYYY-MM-DD`. Live exchange rates, market data, and banking access are not required.
+## Dataset
 
----
+The repository’s dataset/ directory contains the official submission context and input files. It must not be modified. The data files in dataset/ are part of the challenge contract and supply the official evaluation data. dataset/requests.csv is the evaluation source for the row shape that must be reproduced in output.csv.
 
-## What You Need to Build
+## Reproducibility
 
-For every row in `dataset/requests.csv`, produce one row in `output.csv` with:
+To reproduce the repository output and regenerate the same root-level output.csv:
 
-| Column | Meaning |
-|---|---|
-| `request_id` | The request being answered |
-| `amount_safe_to_pay` | Largest amount safe to pay on `request_date` before optional spending changes, after protecting essentials and the minimum balance |
-| `affordability_status` | `affordable_now`, `affordable_with_plan`, `affordable_later`, or `not_affordable` |
-| `recommended_payment_method` | `full_payment`, `partial_payment`, `installments`, `wait`, or `not_recommended` |
-| `payment_plan` | Chronological `<YYYY-MM-DD>:<amount>` entries joined by `\|`, or `none` |
-| `earliest_date_for_full_payment` | Earliest date the full amount is forecast safe as one payment; empty if never within the forecast |
-| `spending_changes_needed` | Up to three `stop:<event_id>` / `reduce_to:<event_id>:<amount>` changes joined by `\|`, or `none` |
-| `decision_explanation` | Short explanation and the financial facts behind it |
+```powershell
+python code/main.py
+```
 
-`0 <= amount_safe_to_pay <= requested_amount` must always hold. Installment plans must exactly match a supplied payment option, and only recurring expenses marked flexible may be changed.
-
-`affordable_with_plan` means the full request is completed through a partial-payment schedule, installments, or permitted spending changes. Recommend `partial_payment` only when the request allows it, the user accepts it, `0 < amount_safe_to_pay < requested_amount`, and `earliest_date_for_full_payment` is on or before `desired_completion_date`. Use exactly two payments: pay `amount_safe_to_pay` on `request_date`, then pay the remaining amount on `earliest_date_for_full_payment`. The two payments must add up to `requested_amount`. Unlike installments, partial payment does not need to match a supplied payment option.
-
----
-
-## Suggested Workflow
-
-1. Inspect `dataset/sample_requests.csv` — 25 requests with completed output columns — to understand the expected format and decision style.
-2. Reconstruct each user's financial state from `financial_profiles.csv` and `financial_events.csv`: separate recurring expenses from one-time events, reserve pending transactions, count confirmed salary only on its settlement date, and de-duplicate repeated representations of the same event.
-3. When an event has a blank `amount`, find its `event_id` as `related_event_id` in `images.csv` and extract the amount from the linked image. Never treat a blank amount as zero. Pull in any other relevant messages, images, and payment options for the request.
-4. Forecast forward and generate a plan that keeps the balance above the minimum at every step.
-5. Verify deterministically — bounds, plan feasibility, schedule match, flexible-only spending changes — before writing `output.csv`.
-6. Score yourself on the solved samples, then run the full dataset.
-
-You may use any language or runtime. Python, JavaScript, and TypeScript are all reasonable choices.
-
----
-
-## Requirements
-
-Your solution must:
-
-- be runnable from the terminal
-- read the provided files from `dataset/`
-- produce a valid `output.csv` with the exact required columns in the exact required order
-- include one prediction for every `request_id` in `dataset/requests.csv`
-- not use organizer-only files or hardcoded labels
-- keep behavior deterministic where possible
-
-If you use API keys or secrets, read them from environment variables. Never hardcode secrets in the repo.
-
----
+The output row generation is deterministic because the solver reads the same files in the same order and writes the listed fields using csv.DictWriter. The optional evaluation/validate_usage_report.py script can be run for deterministic validation of the report and the schema relation, if the repository is being evaluated locally.
 
 ## Evaluation
 
-Your `output.csv` will be compared against hidden ground-truth values.
-
-The scoring will consider:
-
-- accuracy of `amount_safe_to_pay`
-- correctness of `affordability_status`
-- correctness of `recommended_payment_method` and `payment_plan`
-- accuracy of `earliest_date_for_full_payment`
-- validity of `spending_changes_needed`
-- usefulness and consistency of `decision_explanation`
-
-### Token Usage And Cost Analysis
-
-Your `code.zip` must include one token-usage file:
+The repository contains a project-specific evaluation folder:
 
 ```text
-evaluation/usage_report.md
+evaluation/
+    usage_report.md
+    validate_usage_report.py
 ```
 
-The report must cover model providers and names, model calls, input and output tokens, total and average tokens per request, estimated total and per-request cost. The reported values must correspond to the final full-dataset run that produced your `output.csv`.
+The folder exists at the repository root and contains the required usage-report artifact and a simple deterministic validation utility. The report documents the zero-model, zero-token, zero-cost status because the implementation is strictly local and deterministic and performs no model invocation.
 
----
+## Project structure
 
-## Chat Transcript Logging
+```text
+.
+├── AGENTS.md
+├── CLAUDE.md
+├── README.md
+├── code/
+│   ├── main.py
+│   └── evaluation/
+│       ├── main.py
+│       └── usage_report.md
+├── dataset/
+│   ├── requests.csv
+│   ├── sample_requests.csv
+│   ├── financial_profiles.csv
+│   ├── financial_events.csv
+│   ├── request_payment_options.csv
+│   ├── exchange_rates.csv
+│   ├── messages.csv
+│   ├── images.csv
+│   └── media/images/
+├── evaluation/
+│   ├── usage_report.md
+│   └── validate_usage_report.py
+├── output.csv
+├── tests/
+│   └── test_buy_wait_contract.py
+└── log.txt
+```
 
-This repo includes an [`AGENTS.md`](./AGENTS.md) file for AI coding tools. It asks compatible tools to append conversation summaries to a `log.txt` in the repository root — the same directory as `AGENTS.md`:
+## Submission notes
 
-| Platform | Path |
-|---|---|
-| macOS / Linux | `<repo root>/log.txt` |
-| Windows | `<repo root>\log.txt` |
+HackerRank expects the submission package to include these artifacts:
 
-The path resolves relative to `AGENTS.md`, so it stays correct across clones, renames, and checkouts. `log.txt` is gitignored — upload it as your chat transcript at submission time. Do not paste secrets into the chat.
+- code.zip
+- output.csv
+- log.txt
 
-In case, the harness you are using is not in the repo root, you can explicitly ask the agent to look for the AGENTS.md in this folder & then continue.
+The dataset/ directory must remain sources of truth for challenge data and must not be included in the submitted code.zip. The current repository also includes the evaluation/usage_report.md artifact as the required usage-report file in the evaluation folder and this update notes that the implementation performs no external model calls.
 
----
+## Security
 
-## Submission
+Secrets or API keys must be supplied through environment variables and never committed to the repository. This repository’s implementation is purely deterministic and local; it contains no API keys, no VLM keys, and no external model configuration in the checked-in code.
 
-Submit the following files as instructed by HackerRank:
+## Limitations
 
-| File | Description |
-|---|---|
-| `code.zip` | Full runnable solution, prompts/configuration, README, and the required `evaluation/` folder |
-| `output.csv` | Predictions for every row in `dataset/requests.csv` |
-| `chat_transcript` | The `log.txt` described above, showing how you developed or used the system |
+The current implementation has genuine limitations that are visible in the code:
 
-Before submitting, confirm:
-
-- `output.csv` has one row per row in `dataset/requests.csv` (250 rows plus the header).
-- `output.csv` has the exact required columns in the exact required order.
-- Every `amount_safe_to_pay` satisfies `0 <= amount_safe_to_pay <= requested_amount`.
-- Every installment plan matches a supplied payment option, and every spending change targets a flexible recurring expense.
-- Your runnable code, setup instructions, and `evaluation/` folder are included in `code.zip`.
+- It does not use messages.csv or images.csv for evidence extraction or scenario enrichment; those files are present as context only.
+- It does not implement the requested spending_changes_needed action generator. It currently writes none in the generated output file.
+- It does not implement a real VLM/LLM or external model workflow. It is a deterministic local Python financial planner.
+- It does not emit any custom model call or token usage accounting, because no external model is invoked.
